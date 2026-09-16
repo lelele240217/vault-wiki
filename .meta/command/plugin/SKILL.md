@@ -31,9 +31,10 @@ description: "插件生命周期管理：装/升/卸/清单。机械步骤（合
 
 ## Uninstall <id>
 
-1. `python .meta/scripts/wiki_plugin_kernel.py validate` —— 有插件依赖它 → 阻断（除非用户显式级联）
+1. `python .meta/scripts/wiki_plugin_kernel.py can-uninstall <id>` —— 只读预检查：列出依赖插件及命令 owner/consumes 引用；有阻塞则先处理引用并重查。普通 validate 不模拟卸载；本命令不自动级联、不移动目录。
 2. 目录移出 `.meta/plugins/`（归档留存；物理删除永远属人）
 3. `python .meta/scripts/wiki_plugin_kernel.py all` —— 注入区 / registry 中随之消失
+   随后运行 `python .meta/scripts/wiki_plugin_kernel.py verify` 检查投影一致性；孤儿技能副本仅报告，归档处置由人决定。
 4. wiki/log.md「plugin」行
 
 ## ls
@@ -46,3 +47,4 @@ description: "插件生命周期管理：装/升/卸/清单。机械步骤（合
 - 附检契约（可选）：`scripts/check.py` 定义 `check(ctx)`，返回 issue 列表（级别 + 消息），只读零副作用，中文消息、无第三方依赖；ctx.root = 仓库根，ctx.pages = 单次扫描的 wiki 页面集
 - 卸载归档与删除分离：移出 = 卸，删除属人
 - 脚本输出的错误一律阻断操作，修复后重跑；警告（如孤儿副本）仅报告
+- `all` 先准备全部输出再写入；预检查发现标记缺失/重复等错误时不修改目标文件。单文件替换不等于跨文件断电事务，写入系统故障后须检查差异并重跑。

@@ -14,6 +14,8 @@ registry.yaml 插件段、.agents/skills/ 命令副本；protocol / reserved 段
   python .meta/scripts/wiki_plugin_kernel.py registry    # 重建 registry.yaml 插件段（幂等）
   python .meta/scripts/wiki_plugin_kernel.py deploy      # 同步命令部署副本（幂等）
   python .meta/scripts/wiki_plugin_kernel.py all         # validate + inject + registry + deploy
+  python .meta/scripts/wiki_plugin_kernel.py verify      # 只读检查全部投影与副本
+  python .meta/scripts/wiki_plugin_kernel.py can-uninstall <id>  # 只读卸载预检查
 
 manifest 最小 YAML 子集：顶层 `key: value`、`key: []`、块式列表（`  - 项`）、
 一层字段字典（`  name: 描述`）；双引号包裹的值去引号；行内注释（` #` 起）剥离。
@@ -45,8 +47,8 @@ import ast
 import importlib.util
 import os
 import re
-import shutil
 import sys
+import tempfile
 import types
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -152,7 +154,7 @@ def load_plugins():
             continue
         try:
             m = parse_manifest(yml)
-        except ValueError as e:
+        except (ValueError, OSError) as e:
             errors.append(f"[error] {name}/PLUGIN.yaml: {e}")
             continue
         plugins[name] = m
@@ -165,6 +167,15 @@ def validate(plugins, errors):
         for k in REQUIRED_KEYS:
             if k not in m:
                 errors.append(f"[error] {name}/PLUGIN.yaml: missing field {k}")
+        for k in ("id", "version", "updated", "inject"):
+            if not isinstance(m.get(k), str) or not m[k].strip():
+                errors.append(f"[error] {name}/: {k} must be a non-empty string")
+        for k in ("depends", "attachment", "commands", "usage", "checks"):
+            if k in m and (not isinstance(m[k], list) or
+                           any(not isinstance(v, str) or not v.strip() for v in m[k])):
+                errors.append(f"[error] {name}/: {k} must be a list of strings")
+        if not isinstance(m.get("fields"), dict):
+            errors.append(f"[error] {name}/: fields must be a mapping")
         if m.get("id") and m["id"] != name:
             errors.append(f"[error] {name}/: id ({m['id']}) != directory name")
         if m.get("version") and not re.fullmatch(r"\d+\.\d+", str(m["version"])):
@@ -186,6 +197,8 @@ def validate(plugins, errors):
             else:
                 if not any(isinstance(n, ast.FunctionDef) and n.name == "check" for n in tree.body):
                     errors.append(f"[error] {name}/scripts/check.py: check(ctx) not defined (audit contract)")
+    if errors:
+        return  # 类型未通过时不遍历依赖，避免错误输入引发异常
     # 依赖存在性
     for name, m in sorted(plugins.items()):
         for dep in m.get("depends") or []:
@@ -288,6 +301,9 @@ def do_audit(plugins, only=None):
     """
     import wikilib
 
+    if only and only not in plugins:
+        print(f"[error] 未安装插件：{only}")
+        return 1
     pages = list(wikilib.walk_pages(ROOT))  # 单次扫描，全部插件共享（调用节俭）
     ctx = types.SimpleNamespace(root=ROOT, pages=pages)
     counts = {"error": 0, "warning": 0, "info": 0}
@@ -298,11 +314,18 @@ def do_audit(plugins, only=None):
         cpath = os.path.join(PLUGINS_DIR, pid, "scripts", "check.py")
         if not os.path.exists(cpath):
             continue
-        spec = importlib.util.spec_from_file_location(f"plugin_check_{pid}", cpath)
-        mod = importlib.util.module_from_spec(spec)
         try:
+            spec = importlib.util.spec_from_file_location(f"plugin_check_{pid}", cpath)
+            mod = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(mod)
-            issues = mod.check(ctx) or []
+            issues = mod.check(ctx)
+            if not isinstance(issues, list):
+                raise ValueError("check(ctx) 必须返回列表（无问题返回 []）")
+            for it in issues:
+                if (not isinstance(it, dict) or
+                        it.get("level") not in ("error", "warning", "info") or
+                        not isinstance(it.get("message"), str)):
+                    raise ValueError("附检条目必须包含 level(error/warning/info) 与字符串 message")
         except Exception as e:  # 附检脚本自身故障按 error 报告，不拖垮其余插件
             print(f"[error] ({pid}) check script failed: {e}")
             counts["error"] += 1
@@ -320,10 +343,68 @@ def do_audit(plugins, only=None):
     return 1 if counts["error"] else 0
 
 
-def do_inject(plugins):
+class ProjectionPlan:
+    """先渲染全部变更，再写盘；单文件替换，不承诺跨文件断电原子性。"""
+
+    def __init__(self):
+        self.files = {}
+
+    def content(self, path):
+        if path in self.files:
+            return self.files[path]
+        with open(path, "rb") as handle:
+            return handle.read()
+
+    def read(self, path):
+        return self.content(path).decode("utf-8").replace("\r\n", "\n")
+
+    def stage(self, path, content):
+        self.files[path] = content.encode("utf-8") if isinstance(content, str) else content
+
+    def apply(self, check_only=False):
+        changed = []
+        for path, content in self.files.items():
+            if os.path.exists(path):
+                with open(path, "rb") as handle:
+                    if handle.read() == content:
+                        continue
+            changed.append((path, content))
+        if check_only:
+            for path, _ in changed:
+                print(f"[drift] {os.path.relpath(path, ROOT)}")
+            return not changed
+        # 所有输出先落临时文件，写入准备失败时不替换原文件。
+        staged = []
+        try:
+            for path, content in changed:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with tempfile.NamedTemporaryFile(dir=os.path.dirname(path),
+                                                 prefix=".kernel-", delete=False) as handle:
+                    staged.append((handle.name, path))
+                    handle.write(content)
+            for temp, path in staged:
+                os.replace(temp, path)
+                print(f"[write] {os.path.relpath(path, ROOT)}")
+        finally:
+            for temp, _ in staged:
+                if os.path.exists(temp):
+                    os.unlink(temp)
+        if not changed:
+            print("[sync] 无需更改")
+        return True
+
+
+def find_region(text, start, end):
+    """标记须唯一且顺序正确，避免修改到错误区域。"""
+    if text.count(start) != 1 or text.count(end) != 1:
+        return None
+    return re.search(re.escape(start) + r"\n(.*?)" + re.escape(end), text, re.S)
+
+
+def do_inject(plugins, plan):
     """自 manifests 重建 AGENTS.md 注入区（保留前置说明，块按依赖拓扑+字母序，幂等）。"""
-    text = open(AGENTS_MD, encoding="utf-8").read()
-    m = re.search(re.escape(INJECT_START) + r"\n(.*?)" + re.escape(INJECT_END), text, re.S)
+    text = plan.read(AGENTS_MD)
+    m = find_region(text, INJECT_START, INJECT_END)
     if not m:
         print("[error] AGENTS.md: inject markers (wiki-inject:start/end) not found")
         return False
@@ -339,14 +420,12 @@ def do_inject(plugins):
     if new_region == region:
         print("[inject] region unchanged")
         return True
-    open(AGENTS_MD, "w", encoding="utf-8", newline="\n").write(
-        text[: m.start(1)] + new_region + text[m.end(1):]
-    )
-    print(f"[inject] rebuilt ({len(blocks)} plugin blocks)")
+    plan.stage(AGENTS_MD, text[: m.start(1)] + new_region + text[m.end(1):])
+    print(f"[inject] 待同步 {len(blocks)} 个插件块")
     return True
 
 
-def do_check_inject(plugins):
+def do_check_inject(plugins, plan):
     """自各 manifest 的 checks 列表重建 check 命令注入区（在场即注册，幂等）。
 
     与 AGENTS.md 注入区同构：manifest 是本体，check 块是投影——改检查规则
@@ -355,8 +434,8 @@ def do_check_inject(plugins):
     if not os.path.exists(CHECK_SKILL):
         print("[check-inject] check command absent, skipped")
         return True
-    text = open(CHECK_SKILL, encoding="utf-8").read()
-    m = re.search(re.escape(CHECK_INJECT_START) + r"\n(.*?)" + re.escape(CHECK_INJECT_END), text, re.S)
+    text = plan.read(CHECK_SKILL)
+    m = find_region(text, CHECK_INJECT_START, CHECK_INJECT_END)
     if not m:
         print("[error] check/SKILL.md: inject markers (check-inject:start/end) not found")
         return False
@@ -371,14 +450,12 @@ def do_check_inject(plugins):
     if new_region == m.group(1):
         print("[check-inject] unchanged")
         return True
-    open(CHECK_SKILL, "w", encoding="utf-8", newline="\n").write(
-        text[: m.start(1)] + new_region + text[m.end(1):]
-    )
-    print(f"[check-inject] rebuilt ({len(blocks)} plugin blocks)")
+    plan.stage(CHECK_SKILL, text[: m.start(1)] + new_region + text[m.end(1):])
+    print(f"[check-inject] 待同步 {len(blocks)} 个检查块")
     return True
 
 
-def do_cmd_inject(plugins):
+def do_cmd_inject(plugins, plan):
     """自各 manifest 的 usage 列表按命令 consumes 序重建命令注入区（在场即注册，幂等）。
 
     第三种投影：插件写侧契约 → 命令。命令 frontmatter 声明 consumes（有序，
@@ -392,13 +469,13 @@ def do_cmd_inject(plugins):
         path = os.path.join(COMMANDS_DIR, name, "SKILL.md")
         if not os.path.exists(path):
             continue
-        text = open(path, encoding="utf-8").read()
+        text = plan.read(path)
         consumes = wikilib.parse_frontmatter(text).get("consumes")
         if consumes is None:
             continue
         if not isinstance(consumes, list):
             consumes = _owner_list(consumes)
-        m = re.search(re.escape(CMD_INJECT_START) + r"\n(.*?)" + re.escape(CMD_INJECT_END), text, re.S)
+        m = find_region(text, CMD_INJECT_START, CMD_INJECT_END)
         if not m:
             print(f"[error] command {name}/: inject markers (cmd-inject:start/end) not found")
             ok = False
@@ -412,18 +489,16 @@ def do_cmd_inject(plugins):
         new_region = "\n\n".join(blocks) + "\n" if blocks else "\n"
         if new_region == m.group(1):
             continue
-        open(path, "w", encoding="utf-8", newline="\n").write(
-            text[: m.start(1)] + new_region + text[m.end(1):]
-        )
-        print(f"[cmd-inject] {name}: rebuilt ({len(blocks)} usage blocks)")
+        plan.stage(path, text[: m.start(1)] + new_region + text[m.end(1):])
+        print(f"[cmd-inject] {name}: 待同步 {len(blocks)} 个用法块")
     return ok
 
 
-def do_registry(plugins):
+def do_registry(plugins, plan):
     """自 manifests 的 fields 重建 registry.yaml 插件段（protocol / reserved 段不动）。"""
-    text = open(REGISTRY, encoding="utf-8").read()
+    text = plan.read(REGISTRY)
     m = re.search(r"^plugins:\n(.*?)^reserved:", text, re.S | re.M)
-    if not m:
+    if not m or len(re.findall(r"^plugins:", text, re.M)) != 1 or len(re.findall(r"^reserved:", text, re.M)) != 1:
         print("[error] registry.yaml: plugins:/reserved: section structure not found")
         return False
     lines = []
@@ -439,39 +514,60 @@ def do_registry(plugins):
     if body == m.group(1):
         print("[registry] plugin section unchanged")
         return True
-    open(REGISTRY, "w", encoding="utf-8", newline="\n").write(
-        text[: m.start(1)] + body + text[m.end(1):]
-    )
-    print("[registry] plugin section rebuilt")
+    plan.stage(REGISTRY, text[: m.start(1)] + body + text[m.end(1):])
+    print("[registry] 插件段待同步")
     return True
 
 
-def do_deploy():
+def do_deploy(plan):
     """同步 .meta/command/*/SKILL.md → .agents/skills/*/SKILL.md；孤儿副本仅报告。"""
     names = sorted(
         d for d in os.listdir(COMMANDS_DIR)
         if os.path.isdir(os.path.join(COMMANDS_DIR, d))
     )
-    changed = 0
+    orphans = []
     for name in names:
         src = os.path.join(COMMANDS_DIR, name, "SKILL.md")
         if not os.path.exists(src):
-            print(f"[warning] command {name}/: SKILL.md missing")
-            continue
+            raise ValueError(f"command {name}/: SKILL.md missing")
         dst_dir = os.path.join(SKILLS_DIR, name)
         dst = os.path.join(dst_dir, "SKILL.md")
-        os.makedirs(dst_dir, exist_ok=True)
-        if not os.path.exists(dst) or open(src, "rb").read() != open(dst, "rb").read():
-            shutil.copyfile(src, dst)
-            changed += 1
-            print(f"[deploy] synced {name}/SKILL.md")
+        plan.stage(dst, plan.content(src))
     if os.path.isdir(SKILLS_DIR):
         for d in sorted(os.listdir(SKILLS_DIR)):
             if d not in names and os.path.isdir(os.path.join(SKILLS_DIR, d)):
                 print(f"[warning] orphan copy .agents/skills/{d}/ (master gone; deletion belongs to human)")
-    if not changed:
-        print("[deploy] all in sync")
-    return True
+                orphans.append(d)
+    return orphans
+
+
+def can_uninstall(plugins, target):
+    """只报告阻塞原因；不移动目录，不自动级联。"""
+    import wikilib
+
+    if target not in plugins:
+        print(f"[error] 未安装插件：{target}")
+        return 1
+    blockers = []
+    for pid, manifest in sorted(plugins.items()):
+        if target in manifest.get("depends", []):
+            blockers.append(f"插件 {pid} 依赖 {target}")
+    for name in sorted(os.listdir(COMMANDS_DIR)):
+        path = os.path.join(COMMANDS_DIR, name, "SKILL.md")
+        if not os.path.isfile(path):
+            continue
+        with open(path, encoding="utf-8") as handle:
+            fm = wikilib.parse_frontmatter(handle.read())
+        for field in ("owner", "consumes"):
+            if target in _owner_list(fm.get(field) or ""):
+                blockers.append(f"命令 {name} 的 {field} 引用 {target}")
+    for message in blockers:
+        print(f"[blocked] {message}")
+    if blockers:
+        print("[uninstall] 请先处理上述依赖和命令引用，再重新预检查；未移动任何文件")
+        return 1
+    print(f"[uninstall] {target} 可移出插件目录；预检查通过，未移动任何文件")
+    return 0
 
 
 def do_ls(plugins):
@@ -493,33 +589,48 @@ def main():
     if cmd == "audit":
         for e in errors:
             print(e)
-        return do_audit(plugins, sys.argv[2] if len(sys.argv) > 2 else None)
-    if cmd not in ("validate", "inject", "registry", "deploy", "all"):
+        result = do_audit(plugins, sys.argv[2] if len(sys.argv) > 2 else None)
+        return 1 if errors else result
+    if cmd not in ("validate", "inject", "registry", "deploy", "all", "verify", "can-uninstall"):
         print(__doc__)
         return 2
     validate(plugins, errors)
-    validate_bindings(plugins, errors)
+    if not errors:
+        validate_bindings(plugins, errors)
     for e in errors:
         print(e)
     if errors:
         print(f"[result] validation failed ({len(errors)} errors) — mechanical actions blocked")
         return 1
     print(f"[validate] all {len(plugins)} plugins passed (fields / id match / deps exist / acyclic / command bindings)")
-    if cmd in ("inject", "all"):
-        if not do_inject(plugins):
+    if cmd == "can-uninstall":
+        if len(sys.argv) != 3:
+            print("用法：wiki_plugin_kernel.py can-uninstall <id>")
+            return 2
+        return can_uninstall(plugins, sys.argv[2])
+    plan = ProjectionPlan()
+    if cmd in ("inject", "all", "verify"):
+        if not do_inject(plugins, plan):
             return 1
-        if not do_check_inject(plugins):
+        if not do_check_inject(plugins, plan):
             return 1
-        if not do_cmd_inject(plugins):
+        if not do_cmd_inject(plugins, plan):
             return 1
-    if cmd in ("registry", "all"):
-        if not do_registry(plugins):
+    if cmd in ("registry", "all", "verify"):
+        if not do_registry(plugins, plan):
             return 1
-    if cmd in ("deploy", "all"):
-        if not do_deploy():
-            return 1
-    return 0
+    orphans = do_deploy(plan) if cmd in ("deploy", "all", "verify") else []
+    ok = plan.apply(check_only=cmd == "verify")
+    if cmd == "verify":
+        ok = ok and not orphans
+        print("[verify] " + ("投影与副本一致" if ok else "存在漂移或孤儿副本；未修改文件"))
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.dont_write_bytecode = True  # 只读检查也不产生 __pycache__
+    try:
+        sys.exit(main())
+    except (OSError, ValueError) as exc:
+        print(f"[error] {exc}")
+        sys.exit(1)
