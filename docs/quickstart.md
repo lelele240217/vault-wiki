@@ -32,7 +32,7 @@
 python .meta/scripts/wiki_plugin_kernel.py all
 ```
 
-预期：11 插件 validate 通过、注入区 unchanged、命令副本 in sync。报错即拷贝不完整，修完重跑。
+预期：当前 14 插件 validate 通过、投影收敛、命令副本同步。报错先按信息修复，再重跑。之后执行 `python .meta/scripts/wiki_plugin_kernel.py verify`，只读确认投影与副本一致。
 
 ## 首跑验证
 

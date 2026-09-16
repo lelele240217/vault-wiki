@@ -14,7 +14,7 @@
   python .meta/scripts/pipeline.py log <类型> <一句话>   # 容量归档 + 置顶加 log 行
   python .meta/scripts/pipeline.py verify             # 写后自证：附检 + 派生区漂移检查
 
-类型枚举：map / save / query / check / plugin / other（log 插件）。
+类型枚举：map / save / query / check / plugin / todo / other（log 插件）。
 概念页判定（谁入索引）：wiki/ 下所有 .md，排除——保留名（index.md、log.md）、
 wiki 根派生页（hot.md、tags.md）、archive/ 子树（不可变区，本脚本永不改写其中文件）。
 """
@@ -42,7 +42,7 @@ HOT_MAX_ENTRIES = 25
 HOT_MAX_DAYS = 5
 HOT_MAX_CHARS = 200
 LOG_MAX_ENTRIES = 100
-TYPE_ORDER = ["map", "save", "query", "check", "plugin", "other"]
+TYPE_ORDER = ["map", "save", "query", "check", "plugin", "todo", "other"]
 HOT_HEADER = ("# 热缓存\n\n> 最近变更摘要；≤25 条且 <5 日，窗外即删；可整体再生。"
               "规则见 `.meta/plugins/hot/`，写走 `pipeline.py hot`。\n")
 LOG_HEADER = ("# 运行日志\n\n> 置顶追加、只增不删；条目 = `- YYYY-MM-DD <类型>：一句话`。"

@@ -19,6 +19,7 @@
 
 ## 过往操作
 
+- 2026-09-16 内核可靠性修复与体验：见 docs/kernel-reliability.md。
 - 2026-09-14 structure 0.2：声明页落 `wiki/structure.md`（structure 块映射机械可读，type 领地值扩 structure；漂移检测升级附检 diff，冒烟双向实锤）；wikilib 子键放宽（目录名/中文键曾解析为 None，承重件实锤修补）
 - 2026-09-14 vault 治理批次：structure 立设（第十四，布局声明+漂移检测）；vault 0.4 认领 url；mapping 0.7——孤儿报文带引用计数、重算写 log 行；user-write 四预设入档
 - 2026-09-14 指针概念成文 `docs/pointers.md`：定义 / 五件构成 / 系统实例盘点（含 todo 时间维）/ 设计准则；AGENTS 与 README 指针随更

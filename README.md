@@ -43,6 +43,7 @@
 
 ## 文档指针
 
+- [本轮改动清单：内核可靠性与体验](docs/changes/2026-09-16-kernel-reliability.md) — 修改位置、原因、前后差异与验证结果
 - `docs/quickstart.md` — 快速开始：部署五步与首跑验证（走查）
 - `AGENTS.md` — 宪法与准则（agent 先读）
 - `log.md` — 工程日志：现状、阶段、过往操作
